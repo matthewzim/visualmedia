@@ -1,0 +1,543 @@
+// Vinyl Canyon Music Visualizer
+// A first-person journey through vinyl grooves that respond to music
+
+const canvas = document.createElement('canvas');
+document.body.appendChild(canvas);
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+document.body.style.margin = '0';
+document.body.style.overflow = 'hidden';
+document.body.style.backgroundColor = 'black';
+
+// Create full page container
+const container = document.createElement('div');
+container.style.position = 'absolute';
+container.style.top = '0';
+container.style.left = '0';
+container.style.width = '100%';
+container.style.height = '100%';
+container.style.display = 'flex';
+container.style.flexDirection = 'column';
+container.style.alignItems = 'center';
+container.style.color = 'white';
+container.style.fontFamily = 'Arial, sans-serif';
+document.body.appendChild(container);
+
+// Add title and file input
+const title = document.createElement('h1');
+title.textContent = 'Vinyl Canyon Visualizer';
+title.style.marginBottom = '10px';
+title.style.zIndex = '10';
+container.appendChild(title);
+
+const fileInput = document.createElement('input');
+fileInput.type = 'file';
+fileInput.accept = 'audio/*';
+fileInput.style.marginBottom = '20px';
+fileInput.style.zIndex = '10';
+container.appendChild(fileInput);
+
+// Add play controls
+const controls = document.createElement('div');
+controls.style.display = 'flex';
+controls.style.gap = '10px';
+controls.style.marginBottom = '20px';
+controls.style.zIndex = '10';
+container.appendChild(controls);
+
+const playButton = document.createElement('button');
+playButton.textContent = 'Play';
+playButton.disabled = true;
+controls.appendChild(playButton);
+
+const pauseButton = document.createElement('button');
+pauseButton.textContent = 'Pause';
+pauseButton.disabled = true;
+controls.appendChild(pauseButton);
+
+// Add status text
+const statusText = document.createElement('div');
+statusText.textContent = 'Select an audio file to begin';
+statusText.style.zIndex = '10';
+statusText.style.position = 'absolute';
+statusText.style.bottom = '20px';
+container.appendChild(statusText);
+
+// WebGL setup
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+if (!gl) {
+  alert('WebGL not supported');
+  throw new Error('WebGL not supported');
+}
+
+// Set up audio context
+let audioContext;
+let analyser;
+let audioSource;
+let audioBuffer;
+let frequencyData;
+let timeData;
+let isPlaying = false;
+
+// Shader programs
+const vertexShaderSource = `
+  attribute vec4 aVertexPosition;
+  attribute vec2 aTextureCoord;
+  
+  uniform mat4 uModelViewMatrix;
+  uniform mat4 uProjectionMatrix;
+  
+  varying highp vec2 vTextureCoord;
+  
+  void main() {
+    gl_Position = uProjectionMatrix * uModelViewMatrix * aVertexPosition;
+    vTextureCoord = aTextureCoord;
+  }
+`;
+
+const fragmentShaderSource = `
+  precision mediump float;
+  
+  varying highp vec2 vTextureCoord;
+  
+  uniform sampler2D uSampler;
+  uniform float uTime;
+  uniform float uBassIntensity;
+  uniform float uMidIntensity;
+  uniform float uTrebleIntensity;
+  uniform float uAmplitude;
+  
+  void main() {
+    // Base groove color
+    vec3 baseColor = vec3(0.1, 0.1, 0.15);
+    
+    // Z-coordinate for the canyon effect (modified by audio)
+    float z = vTextureCoord.y;
+    
+    // Create groove pattern based on position and audio data
+    float groovePattern = sin(vTextureCoord.x * 100.0 + uTime * 2.0) * uBassIntensity * 0.5;
+    groovePattern += sin(vTextureCoord.x * 200.0 + uTime * 3.0) * uMidIntensity * 0.3;
+    groovePattern += sin(vTextureCoord.x * 300.0 + uTime * 4.0) * uTrebleIntensity * 0.2;
+    
+    // Create lighting effect
+    float lightIntensity = 0.3 + 0.7 * pow(abs(groovePattern), 0.5) * (0.8 + 0.2 * sin(uTime * 0.5));
+    
+    // Distance from center creates vinyl-like circular grooves
+    float distFromCenter = length(vTextureCoord - vec2(0.5, 0.5));
+    float circularGroove = sin(distFromCenter * 50.0 - uTime * 0.5) * 0.5 + 0.5;
+    
+    // Combine effects
+    float finalEffect = groovePattern + circularGroove * uAmplitude;
+    
+    // Color variations based on frequencies
+    vec3 bassColor = vec3(0.9, 0.1, 0.2) * uBassIntensity;
+    vec3 midColor = vec3(0.2, 0.7, 0.9) * uMidIntensity;
+    vec3 trebleColor = vec3(0.8, 0.9, 0.3) * uTrebleIntensity;
+    
+    // Combine colors with base
+    vec3 color = baseColor + bassColor + midColor + trebleColor;
+    color *= lightIntensity;
+    
+    // Add distance fog
+    float fogFactor = clamp(z * 2.0, 0.0, 1.0);
+    vec3 fogColor = vec3(0.0, 0.0, 0.1);
+    color = mix(fogColor, color, fogFactor);
+    
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+// Compile shader
+function compileShader(gl, source, type) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.error('Shader compilation error:', gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+  }
+  
+  return shader;
+}
+
+// Initialize shaders
+function initShaderProgram(gl, vsSource, fsSource) {
+  const vertexShader = compileShader(gl, vsSource, gl.VERTEX_SHADER);
+  const fragmentShader = compileShader(gl, fsSource, gl.FRAGMENT_SHADER);
+  
+  const shaderProgram = gl.createProgram();
+  gl.attachShader(shaderProgram, vertexShader);
+  gl.attachShader(shaderProgram, fragmentShader);
+  gl.linkProgram(shaderProgram);
+  
+  if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+    console.error('Shader program linking error:', gl.getProgramInfoLog(shaderProgram));
+    return null;
+  }
+  
+  return shaderProgram;
+}
+
+// Set up buffers for a rectangle that fills the canvas
+function initBuffers(gl) {
+  const positionBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+  
+  const positions = [
+    -1.0, -1.0, 0.0,
+     1.0, -1.0, 0.0,
+     1.0,  1.0, 0.0,
+    -1.0,  1.0, 0.0,
+  ];
+  
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+  
+  const textureCoordBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, textureCoordBuffer);
+  
+  const textureCoordinates = [
+    0.0, 0.0,
+    1.0, 0.0,
+    1.0, 1.0,
+    0.0, 1.0,
+  ];
+  
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(textureCoordinates), gl.STATIC_DRAW);
+  
+  const indexBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+  
+  const indices = [
+    0, 1, 2,
+    0, 2, 3,
+  ];
+  
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+  
+  return {
+    position: positionBuffer,
+    textureCoord: textureCoordBuffer,
+    indices: indexBuffer,
+  };
+}
+
+// Main setup
+function setupWebGL() {
+  const shaderProgram = initShaderProgram(gl, vertexShaderSource, fragmentShaderSource);
+  const buffers = initBuffers(gl);
+  
+  const programInfo = {
+    program: shaderProgram,
+    attribLocations: {
+      vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
+      textureCoord: gl.getAttribLocation(shaderProgram, 'aTextureCoord'),
+    },
+    uniformLocations: {
+      projectionMatrix: gl.getUniformLocation(shaderProgram, 'uProjectionMatrix'),
+      modelViewMatrix: gl.getUniformLocation(shaderProgram, 'uModelViewMatrix'),
+      uSampler: gl.getUniformLocation(shaderProgram, 'uSampler'),
+      uTime: gl.getUniformLocation(shaderProgram, 'uTime'),
+      uBassIntensity: gl.getUniformLocation(shaderProgram, 'uBassIntensity'),
+      uMidIntensity: gl.getUniformLocation(shaderProgram, 'uMidIntensity'),
+      uTrebleIntensity: gl.getUniformLocation(shaderProgram, 'uTrebleIntensity'),
+      uAmplitude: gl.getUniformLocation(shaderProgram, 'uAmplitude'),
+    },
+  };
+  
+  // Create a texture
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  
+  // Fill with a single pixel until we have real data
+  const pixel = new Uint8Array([0, 0, 255, 255]); // Blue
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+  
+  // Animation variables
+  let then = 0;
+  let totalTime = 0;
+  
+  // Projection matrix
+  const fieldOfView = 45 * Math.PI / 180;   // in radians
+  const aspect = gl.canvas.clientWidth / gl.canvas.clientHeight;
+  const zNear = 0.1;
+  const zFar = 100.0;
+  const projectionMatrix = mat4.create();
+  
+  mat4.perspective(projectionMatrix, fieldOfView, aspect, zNear, zFar);
+  
+  // Function to render the scene
+  function render(now) {
+    now *= 0.001;  // convert to seconds
+    const deltaTime = now - then;
+    then = now;
+    totalTime += deltaTime;
+    
+    resizeCanvasToDisplaySize(gl.canvas);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    
+    // Model view matrix - simulates camera movement
+    const modelViewMatrix = mat4.create();
+    mat4.translate(modelViewMatrix, modelViewMatrix, [0.0, 0.0, -2.0]);
+    
+    // Bind vertex position
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+    gl.vertexAttribPointer(
+      programInfo.attribLocations.vertexPosition,
+      3,        // components per vertex
+      gl.FLOAT, // data type
+      false,    // don't normalize
+      0,        // stride
+      0         // offset
+    );
+    gl.enableVertexAttribArray(programInfo.attribLocations.vertexPosition);
+    
+    // Bind texture coordinates
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.textureCoord);
+    gl.vertexAttribPointer(
+      programInfo.attribLocations.textureCoord,
+      2,        // components per vertex
+      gl.FLOAT, // data type
+      false,    // don't normalize
+      0,        // stride
+      0         // offset
+    );
+    gl.enableVertexAttribArray(programInfo.attribLocations.textureCoord);
+    
+    // Bind indices
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.indices);
+    
+    // Use our shader program
+    gl.useProgram(programInfo.program);
+    
+    // Set uniforms
+    gl.uniformMatrix4fv(programInfo.uniformLocations.projectionMatrix, false, projectionMatrix);
+    gl.uniformMatrix4fv(programInfo.uniformLocations.modelViewMatrix, false, modelViewMatrix);
+    gl.uniform1f(programInfo.uniformLocations.uTime, totalTime);
+    
+    // Update audio data if playing
+    if (isPlaying && analyser) {
+      analyser.getByteFrequencyData(frequencyData);
+      analyser.getByteTimeDomainData(timeData);
+      
+      // Calculate frequency band intensities
+      const bassSum = frequencyData.slice(0, 10).reduce((a, b) => a + b, 0);
+      const midSum = frequencyData.slice(10, 100).reduce((a, b) => a + b, 0);
+      const trebleSum = frequencyData.slice(100, 256).reduce((a, b) => a + b, 0);
+      
+      const bassIntensity = bassSum / (10 * 255);
+      const midIntensity = midSum / (90 * 255);
+      const trebleIntensity = trebleSum / (156 * 255);
+      
+      // Calculate overall amplitude
+      let amplitude = 0;
+      for (let i = 0; i < timeData.length; i++) {
+        const value = ((timeData[i] - 128) / 128) * 2;
+        amplitude += Math.abs(value);
+      }
+      amplitude = amplitude / timeData.length;
+      
+      // Set uniform values for the shaders
+      gl.uniform1f(programInfo.uniformLocations.uBassIntensity, bassIntensity);
+      gl.uniform1f(programInfo.uniformLocations.uMidIntensity, midIntensity);
+      gl.uniform1f(programInfo.uniformLocations.uTrebleIntensity, trebleIntensity);
+      gl.uniform1f(programInfo.uniformLocations.uAmplitude, amplitude);
+    } else {
+      // Default values when not playing
+      gl.uniform1f(programInfo.uniformLocations.uBassIntensity, 0.3);
+      gl.uniform1f(programInfo.uniformLocations.uMidIntensity, 0.3);
+      gl.uniform1f(programInfo.uniformLocations.uTrebleIntensity, 0.3);
+      gl.uniform1f(programInfo.uniformLocations.uAmplitude, 0.5);
+    }
+    
+    // Tell WebGL to use our texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(programInfo.uniformLocations.uSampler, 0);
+    
+    // Draw
+    gl.drawElements(
+      gl.TRIANGLES,
+      6,             // vertex count
+      gl.UNSIGNED_SHORT,
+      0              // offset
+    );
+    
+    // Request next frame
+    requestAnimationFrame(render);
+  }
+  
+  // Start rendering
+  requestAnimationFrame(render);
+}
+
+// Ensure canvas always matches display size
+function resizeCanvasToDisplaySize(canvas) {
+  const displayWidth = canvas.clientWidth;
+  const displayHeight = canvas.clientHeight;
+  
+  if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+    canvas.width = displayWidth;
+    canvas.height = displayHeight;
+  }
+}
+
+// Audio setup
+function setupAudio() {
+  try {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    
+    frequencyData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+  } catch (e) {
+    console.error('Web Audio API not supported:', e);
+    statusText.textContent = 'Error: Web Audio API not supported';
+  }
+}
+
+// Load audio file
+fileInput.addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  
+  statusText.textContent = 'Loading audio...';
+  
+  if (!audioContext) setupAudio();
+  
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const arrayBuffer = e.target.result;
+    
+    audioContext.decodeAudioData(arrayBuffer, function(buffer) {
+      audioBuffer = buffer;
+      statusText.textContent = `Loaded: ${file.name}`;
+      playButton.disabled = false;
+      pauseButton.disabled = true;
+    }, function(e) {
+      console.error('Error decoding audio:', e);
+      statusText.textContent = 'Error: Could not decode audio file';
+    });
+  };
+  
+  reader.onerror = function() {
+    statusText.textContent = 'Error: Could not read file';
+  };
+  
+  reader.readAsArrayBuffer(file);
+});
+
+// Play audio
+playButton.addEventListener('click', function() {
+  if (!audioBuffer) return;
+  
+  if (isPlaying) {
+    audioSource.stop();
+  }
+  
+  audioSource = audioContext.createBufferSource();
+  audioSource.buffer = audioBuffer;
+  audioSource.connect(analyser);
+  analyser.connect(audioContext.destination);
+  audioSource.start(0);
+  
+  isPlaying = true;
+  playButton.disabled = true;
+  pauseButton.disabled = false;
+  statusText.textContent = 'Playing...';
+});
+
+// Pause audio
+pauseButton.addEventListener('click', function() {
+  if (isPlaying && audioSource) {
+    audioSource.stop();
+    isPlaying = false;
+    playButton.disabled = false;
+    pauseButton.disabled = true;
+    statusText.textContent = 'Paused';
+  }
+});
+
+// Initialize glMatrix for matrix operations
+const mat4 = {
+  create: function() {
+    return new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ]);
+  },
+  
+  perspective: function(out, fovy, aspect, near, far) {
+    const f = 1.0 / Math.tan(fovy / 2);
+    const nf = 1 / (near - far);
+    
+    out[0] = f / aspect;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = 0;
+    out[5] = f;
+    out[6] = 0;
+    out[7] = 0;
+    out[8] = 0;
+    out[9] = 0;
+    out[10] = (far + near) * nf;
+    out[11] = -1;
+    out[12] = 0;
+    out[13] = 0;
+    out[14] = (2 * far * near) * nf;
+    out[15] = 0;
+    
+    return out;
+  },
+  
+  translate: function(out, a, v) {
+    const x = v[0], y = v[1], z = v[2];
+    
+    if (a === out) {
+      out[12] = a[0] * x + a[4] * y + a[8] * z + a[12];
+      out[13] = a[1] * x + a[5] * y + a[9] * z + a[13];
+      out[14] = a[2] * x + a[6] * y + a[10] * z + a[14];
+      out[15] = a[3] * x + a[7] * y + a[11] * z + a[15];
+    } else {
+      const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3],
+            a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7],
+            a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+      
+      out[0] = a00; out[1] = a01; out[2] = a02; out[3] = a03;
+      out[4] = a10; out[5] = a11; out[6] = a12; out[7] = a13;
+      out[8] = a20; out[9] = a21; out[10] = a22; out[11] = a23;
+      
+      out[12] = a00 * x + a10 * y + a20 * z + a[12];
+      out[13] = a01 * x + a11 * y + a21 * z + a[13];
+      out[14] = a02 * x + a12 * y + a22 * z + a[14];
+      out[15] = a03 * x + a13 * y + a23 * z + a[15];
+    }
+    
+    return out;
+  }
+};
+
+// Check for WebGL support and initialize
+window.onload = function() {
+  try {
+    setupWebGL();
+    statusText.textContent = 'Select an audio file to begin';
+  } catch (e) {
+    console.error(e);
+    statusText.textContent = 'Error: Could not initialize WebGL';
+  }
+};
+
+// Handle window resize
+window.addEventListener('resize', function() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+});
